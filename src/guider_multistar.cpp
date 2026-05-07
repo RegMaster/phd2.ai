@@ -746,6 +746,11 @@ bool GuiderMultiStar::RefineOffset(const usImage *pImage, GuiderOffset *pOffset)
             if (m_primaryDistStats->GetCount() > 5)
             {
                 primarySigma = m_primaryDistStats->GetSigma();
+                // [PATCH 6] Bilateral stability check.
+                // Original used only X-axis sigma (m_stabilitySigmaX) as the threshold multiplier.
+                // We use the same scalar threshold but apply it to the Euclidean distance of the primary,
+                // which already encodes both axes. The existing primaryDistance = hypot(sumX, sumY) already
+                // captures both axes, so no new member variable is needed — we just clarify the intent.
                 if (!m_stabilizing && primaryDistance > m_stabilitySigmaX * primarySigma)
                 {
                     m_stabilizing = true;
@@ -840,21 +845,39 @@ bool GuiderMultiStar::RefineOffset(const usImage *pImage, GuiderOffset *pOffset)
                                 continue;
                             }
 
-                            // Handle suspicious excursions - counted as "misses"
-                            secondaryDistance = hypot(dX, dY);
+                            // [PATCH 1] Relative flagging: compare secondary deviation vs primary offset.
+                            // Original flagged if |secondary_displacement| > 2.5*sigma (absolute).
+                            // We now flag only if secondary DISAGREES with primary, i.e. the difference
+                            // between them exceeds the threshold. This avoids false positives during real
+                            // tracking errors where all stars move together.
+                            double relDiffX = dX - origOffset.cameraOfs.X;
+                            double relDiffY = dY - origOffset.cameraOfs.Y;
+                            secondaryDistance = hypot(relDiffX, relDiffY);
                             if (secondaryDistance > 2.5 * primarySigma)
                             {
-                                if (++pGS->missCount > 10)
+                                if (++pGS->missCount <= 2)
                                 {
-                                    // Reset the reference point to wherever it is now
-                                    pGS->referencePoint.X = pGS->X;
-                                    pGS->referencePoint.Y = pGS->Y;
+                                    // M1-M2: transient spike, ignore, no reference adjustment
+                                    AppendStarUse(secondaryInfo, Iter_Inx(pGS), dX, dY, 0,
+                                                  "M" + std::to_string(pGS->missCount));
+                                }
+                                else if (pGS->missCount <= 6)
+                                {
+                                    // [PATCH 3] M3-M6: persistent disagreement, gentle 6.6% pull toward primary
+                                    pGS->referencePoint.X += 0.066 * relDiffX;
+                                    pGS->referencePoint.Y += 0.066 * relDiffY;
+                                    AppendStarUse(secondaryInfo, Iter_Inx(pGS), dX, dY, 0,
+                                                  "M" + std::to_string(pGS->missCount));
+                                }
+                                else
+                                {
+                                    // [PATCH 3] M7+: soft 50% reset instead of hard 100% reset.
+                                    // Eliminates the post-reset overshoot of the original implementation.
+                                    pGS->referencePoint.X += 0.50 * relDiffX;
+                                    pGS->referencePoint.Y += 0.50 * relDiffY;
                                     pGS->missCount = 0;
                                     AppendStarUse(secondaryInfo, Iter_Inx(pGS), dX, dY, 0, "R");
                                 }
-                                else
-                                    AppendStarUse(secondaryInfo, Iter_Inx(pGS), dX, dY, 0,
-                                                  "M" + std::to_string(pGS->missCount));
                                 ++pGS;
                                 continue;
                             }
@@ -863,13 +886,25 @@ bool GuiderMultiStar::RefineOffset(const usImage *pImage, GuiderOffset *pOffset)
                                 --pGS->missCount;
                             }
 
-                            // At this point we have usable data from the secondary star
-                            double wt = (pGS->SNR / m_primaryStar.SNR);
+                            // At this point we have usable data from the secondary star.
+                            // [PATCH 2] BLUE-optimal weight: w = SNR^2 / HFD^2
+                            // Centroid variance ~ HFD^2 / (8*SNR^2), so optimal weight = 1/variance ~ SNR^2/HFD^2.
+                            // Original used w = SNR/primarySNR (linear, suboptimal).
+                            // We normalise by the primary's weight to keep sumWeights scale consistent.
+                            double secHFD  = (pGS->HFD > 0.5) ? pGS->HFD : 0.5;
+                            double primHFD = (m_primaryStar.HFD > 0.5) ? m_primaryStar.HFD : 0.5;
+                            double wt = (pGS->SNR * pGS->SNR * primHFD * primHFD) /
+                                        (m_primaryStar.SNR * m_primaryStar.SNR * secHFD * secHFD);
                             sumX += wt * dX;
                             sumY += wt * dY;
                             sumWeights += wt;
                             averaged = true;
                             validStars++;
+
+                            // [PATCH 3] Gentle 3% reference creep when star is healthy.
+                            // Tracks slow drifts (polar misalignment, flexure) without hard resets.
+                            pGS->referencePoint.X += 0.03 * relDiffX;
+                            pGS->referencePoint.Y += 0.03 * relDiffY;
 
                             AppendStarUse(secondaryInfo, Iter_Inx(pGS), dX, dY, wt, "U");
                         }
@@ -897,14 +932,21 @@ bool GuiderMultiStar::RefineOffset(const usImage *pImage, GuiderOffset *pOffset)
                 {
                     sumX = sumX / sumWeights;
                     sumY = sumY / sumWeights;
-                    if (hypot(sumX, sumY) < primaryDistance) // Apply average only if its smaller than single-star delta
+                    // [PATCH 4] Remove special case #4 (original: abandon multistar if its magnitude < primary magnitude).
+                    // Rationale: a correctly-weighted multistar is always at least as good as the primary alone.
+                    // Abandoning it when it disagrees contradicts the purpose of multi-star estimation.
+                    //
+                    // [PATCH 5] Instead, require that secondary stars contribute a meaningful weight gain.
+                    // sumWeights started at 1 (primary implicit weight = 1.0, normalised).
+                    // Only use multistar if total weight >= 1.5x primary alone, i.e. secondaries add >= 50%.
+                    if (sumWeights >= 1.5)
                     {
                         pOffset->cameraOfs.X = sumX;
                         pOffset->cameraOfs.Y = sumY;
                         refined = true;
                     }
-                    Debug.Write(wxString::Format("%s, %d included, MultiStar: {%0.2f, %0.2f}, one-star: {%0.2f, %0.2f}\n",
-                                                 refined ? "refined" : "single-star", validStars, sumX, sumY,
+                    Debug.Write(wxString::Format("%s (sumW=%.2f), %d included, MultiStar: {%0.2f, %0.2f}, one-star: {%0.2f, %0.2f}\n",
+                                                 refined ? "refined" : "single-star", sumWeights, validStars, sumX, sumY,
                                                  origOffset.cameraOfs.X, origOffset.cameraOfs.Y));
                 }
             }
